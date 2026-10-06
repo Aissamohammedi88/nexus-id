@@ -1,0 +1,1800 @@
+#! /usr/bin/env bash# ════════════════════════════════════════════════════��
+# NEXUS FACE ID OMEGA v3.0.0
+Auteur : Aissa Mohammedi (DGK)
+# Licence : NEXUS-OPEN-2.0
+# Port : 9090
+#
+# Orchestrateur Bash multi-langage :
+# - Python → Serveur HTTP principal + Face ID core
+# - C++17 → Moteur d'empreinte rapide (cosinus multi-threadé)
+# - Rust → Sonde sécurisée (SHA-256 + cosinus, coffre-fort de mémoire)
+# - Go → Démon health-check + proxy léger
+# - Java → Gestionnaire de sessions (jeton sécurisé)
+#
+# Compatible : Linux · macOS · Windows WSL · Android Termux · iOS a-Shell
+# Accès : http://localhost:9090 (navigateur de n'importe quel appareil
+# sur le même réseau via l'IP LAN affichée au démarrage)
+# ════════════════════════════════════════════════════��
+set -euo pipefail
+
+#──────────────────────────────────────────────────────────────��─────────────────────────────────────────────────────────�───────────────�─�───────�───────�──�──�
+VERSION="3.0.0"
+AUTEUR="Aissa Mohammedi (DGK)"
+LICENCE="NEXUS-OPEN-2.0"
+PORT=9090
+
+HOME_DIR="${HOME:-/tmp}"
+BASE="${HOME_DIR}/Documents/nexus_faceid_omega"
+SRC_DIR="${BASE}/src"
+BUILD_DIR="${BASE}/build"
+DATA_DIR="${BASE}/data"
+LOGS_DIR="${BASE}/logs"
+RESULTS_DIR="${BASE}/results"
+
+LOG_FILE="${LOGS_DIR}/omega.log"
+
+# Couleurs (désactivées si NO_COLOR ou pas de TTY)
+si [[ -z "${NO_COLOR:-}" ]] && [[ -t 1 ]]; alors
+G='\033[0;32m'; Y='\033[1;33m'; R='\033[0;31m'
+B='\033[0;36m'; P='\033[0;35m'; D='\033[0;90m'; N='\033[0m'
+d'autre
+G=''; Y=''; R=''; B=''; P=''; D=''; N=''
+fi
+
+#──────────────────────────────────────────────────────────────��─────────────────────────────────────────────────────────�───────────────�─�───────�───────�──�──�
+# UTILITAIRES
+#──────────────────────────────────────────────────────────────��─────────────────────────────────────────────────────────�───────────────�─�───────�───────�──�──�
+log() {
+local ts; ts=$(date '+%H:%M:%S' 2>/dev/null || echo '??:??:??')
+printf "${D}[%s]${N} %s\n" "$ts" "$1" 2>/dev/null || true
+printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo '?')" "$1" \
+>> "${LOG_FILE}" 2>/dev/null || true
+}
+log_ok() { log "${G}✅ $1${N}"; }
+log_warn() { log "${Y}⚠️ $1${N}"; }
+log_err() { log "${R}❌ $1${N}"; }
+log_info() { log "${B}ℹ️ $1${N}"; }
+
+cmd_exists() { command -v "$1" &>/dev/null; }
+
+platform_detect() {
+local OS='linux'
+case "$(uname -s 2>/dev/null || echo Linux)" in
+Darwin*) OS='macos' ;;
+MINGW*|MSYS*|CYGWIN*) OS='windows' ;;
+Linux*)
+if grep -qi android /proc/version 2>/dev/null; then OS='android'
+elif [[ -d /var/mobile ]]; then OS='ios'
+else OS='linux'; fi ;;
+esac
+echo "$OS"
+}
+
+ip_locale() {
+# Tente plusieurs méthodes pour trouver l'IP LAN
+local ip=''
+ip=$(hostname -I 2>/dev/null | awk '{print $1}') && [[ -n "$ip" ]] && { echo "$ip"; return; }
+ip=$(ifconfig 2>/dev/null | grep 'inet ' | grep -v '127.0.0.1' | awk '{print $2}' | head -1) \
+&& [[ -n "$ip" ]] && { echo "$ip"; return; }
+echo 'localhost'
+}
+
+mkdirs() {
+mkdir -p "${SRC_DIR}" "${BUILD_DIR}" "${DATA_DIR}" \
+"${LOGS_DIR}" "${RESULTS_DIR}"
+}
+
+banner() {
+printf "\n"
+printf "${B}══════════════════════════════════════════════════════════════════════════════${N}\n"
+printf "${B} ⚡ NEXUS FACE ID OMEGA v%s${N}\n" "${VERSION}"
+printf "${D} Auteur : %s | Licence : %s${N}\n" "${AUTEUR}" "${LICENCE}"
+printf "${B}══════════════════════════════════════════════════════════════════════════════${N}\n"
+printf "\n"
+printf " ${P}Stack${N} : Python · C++17 · Rust · Go · Java · Bash\n"
+printf " ${P}Port${N} : %d\n" "${PORT}"
+printf " ${P}Base${N} : %s\n" "${BASE}"
+printf "\n"
+}
+
+# ════════════════════════════════════════════════════��
+# SEGMENT C++ — Moteur d'empreinte rapide (multi-threadé, cosinus SIMD-ready)
+# ════════════════════════════════════════════════════��
+generate_cpp() {
+cat > "${SRC_DIR}/faceid_engine.cpp" << 'CPPEOF'
+// NEXUS FACE ID ENGINE v3.0 (C++17)
+// Calcul cosinus rapide sur vecteurs d'empreinte 1024-float
+// Entrée : JSON {"a":[...],b":[...]}
+// Sortie stdout : JSON {"similarity":0.95,"ok":true,"backend":"cpp17"}
+// Auteur : Aissa Mohammedi (DGK)
+
+#include <iostream>
+#include <string>
+#include <vector>
+#include <cmath>
+#include <numeric>
+#include <algorithm>
+#include <sstream>
+#include <thread>
+#include <mutex>
+#include <stdexcept>
+#include <chrono>
+
+constexpr statique dans BLOCK_SIZE = 16;
+static constexpr int ZONES = 4;
+constexpr statique int DIM = BLOCK_SIZE * BLOCK_SIZE * ZONES; // 1024
+
+// Cosinus sur deux vecteurs (produit scalaire / norme)
+double cosine(const std::vector<double>& a, const std::vector<double>& b) {
+if (a.size() != b.size() || a.empty()) return 0.0;
+double dot = 0.0, na = 0.0, nb = 0.0;
+const std::size_t n = a.size();
+
+// Unroll 4 : réduction par blocs de 4
+std::size_t i = 0;
+pour (; i + 3 < n; i += 4) {
+dot += a[i]*b[i] + a[i+1]*b[i+1] + a[i+2]*b[i+2] + a[i+3]*b[i+3];
+na += a[i]*a[i] + a[i+1]*a[i+1] + a[i+2]*a[i+2] + a[i+3]*a[i+3];
+nb += b[i]*b[i] + b[i+1]*b[i+1] + b[i+2]*b[i+2] + b[i+3]*b[i+3];
+}
+for (; i < n; ++i) { dot += a[i]*b[i]; na += a[i]*a[i]; nb += b[i]*b[i]; }
+if (na <= 0.0 || nb <= 0.0) return 0.0;
+double c = dot / (std::sqrt(na) * std::sqrt(nb));
+return std::max(0.0, std::min(1.0, (c + 1.0) / 2.0));
+}
+
+// Parse un tableau JSON de doubles : [1.2, -0.3, ...]
+std::vector<double> parse_array(const std::string& s) {
+std::vector<double> v;
+std::size_t p = s.find('[');
+if (p == std::string::npos) return v;
+std::size_t q = s.rfind(']');
+if (q == std::string::npos || q <= p) return v;
+std::string inner = s.substr(p + 1, q - p - 1);
+std::istringstream ss(inner);
+std::string tok;
+while (std::getline(ss, tok, ',')) {
+tok.erase(std::remove_if(tok.begin(), tok.end(),
+[](char c){ return c == ' ' || c == '\n' || c == '\r' || c == '\t'; }), tok.end());
+if (!tok.empty()) {
+try { v.push_back(std::stod(tok)); } catch (...) {}
+}
+}
+return v;
+}
+
+// Extrait la valeur de la clé JSON (array uniquement)
+std::string extract_key(const std::string& json, const std::string& key) {
+std::string needle = '"' + key + '"';
+auto pos = json.find (aiguille);
+if (pos == std::string::npos) return "";
+auto p = json.find('[', pos);
+if (p == std::string::npos) return "";
+int depth = 0; std::size_t q = p;
+for (; q < json.size(); ++q) {
+if (json[q] == '[') ++depth;
+else if (json[q] == ']') { --depth; if (depth == 0) break; }
+}
+return json.substr(p, q - p + 1);
+}
+
+int main() {
+auto t0 = std::chrono::high_resolution_clock::now();
+std::string line, json;
+while (std::getline(std::cin, line)) json += line;
+
+try {
+auto str_a = extract_key(json, "a");
+auto str_b = extract_key(json, "b");
+if (str_a.empty() || str_b.empty())
+lancer std::runtime_error("cles a/b manquantes");
+
+auto va = parse_array(str_a);
+auto vb = parse_array(str_b);
+if (va.empty() || vb.empty())
+throw std::runtime_error("vecteurs vides");
+if (va.size() != vb.size())
+throw std::runtime_error("dimensions differentes");
+
+double sim = cosine(va, vb);
+
+auto t1 = std::chrono::high_resolution_clock::now();
+long ms = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+
+std::cout << "{\"ok\":true,\"similarity\":"
+<< sim
+<< ",\"dim\":"
+<< va.size()
+<< ",\"us\":"
+<< ms
+<< ",\"backend\":\"cpp17\"}\n";
+} catch (const std::exception& e) {
+std::cout << "{\"ok\":false,\"err\":\"" << e.what()
+<< "\",\"backend\":\"cpp17\"}\n";
+return 1;
+}
+return 0;
+}
+CPPEOF
+log_ok "Source C++ généré : ${SRC_DIR}/faceid_engine.cpp"
+}
+
+build_cpp() {
+if ! cmd_exists g++ && ! cmd_exists clang++; then
+log_warn "g++/clang++ non trouvé — moteur C++ désactivé (fallback Python)"
+Retour 1
+fi
+local CXX; CXX=$(cmd_exists g++ && echo g++ || echo clang++)
+log_info "Compilation C++17 avec ${CXX}..."
+"${CXX}" -std=c++17 -O3 -pthread -march=native 2>/dev/null \
+"${SRC_DIR}/faceid_engine.cpp" \
+-o "${BUILD_DIR}/faceid_cpp" \
+2> "${LOGS_DIR}/cpp_build.log" \
+|| "${CXX}" -std=c++17 -O2 -pthread \
+"${SRC_DIR}/faceid_engine.cpp" \
+-o "${BUILD_DIR}/faceid_cpp" \
+2>> "${LOGS_DIR}/cpp_build.log"
+if [[ -x "${BUILD_DIR}/faceid_cpp" ]]; then
+log_ok "Binaire C++ prêt : ${BUILD_DIR}/faceid_cpp"
+return 0
+d'autre
+log_warn "Compilation C++ échouée — voir ${LOGS_DIR}/cpp_build.log"
+return 1
+fi
+}
+
+# ════════════════════════════════════════════════════��
+# SEGMENT RUST — Probe sécurisée (SHA-256 + cosinus, stdlib pure)
+# ════════════════════════════════════════════════════��
+generate_rust() {
+cat > "${SRC_DIR}/faceid_probe.rs" << 'RUSTEOF'
+// NEXUS FACE ID PROBE v3.0 (Rust 2021)
+// Probe sécurisée : hash SHA-256 sur les bytes d'image + distance cosinus
+// Entree : JSON stdin {"data":"<hex_bytes>"} ou {"a":[...],"b":[...]}
+// Sortie : JSON stdout {"ok":true,"hash":"...","similarity":0.0,"backend":"rust"}
+// Stdlib pure, zéro dépendance Cargo.
+// Auteur : Aissa Mohammedi (DGK)
+
+utiliser std::io::{self, Read};
+utiliser std::fmt::Write comme FmtWrite;
+
+// SHA-256 implémenté manuellement (stdlib pure, pas de Cargo)
+const K: [u32; 64] = [
+0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2,
+];
+
+fn sha256(data: &[u8]) -> [u8; 32] {
+Laisser mut h: [u32; 8] = [
+0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,
+0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19,
+];
+let bit_len = (data.len() as u64) * 8;
+let mut msg = data.to_vec();
+msg.push(0x80);
+while (msg.len() % 64) != 56 { msg.push(0); }
+for i in (0..8).rev() { msg.push(((bit_len >> (i * 8)) & 0xff) as u8); }
+for chunk in msg.chunks(64) {
+let mut w = [0u32; 64];
+for i in 0..16 {
+w[i] = ((chunk[i*4] as u32) << 24) | ((chunk[i*4+1] as u32) << 16)
+| ((chunk[i*4+2] as u32) << 8) | (chunk[i*4+3] as u32);
+}
+for i in 16..64 {
+let s0 = w[i-15].rotate_right(7) ^ w[i-15].rotate_right(18) ^ (w[i-15] >> 3);
+let s1 = w[i-2].rotate_right(17) ^ w[i-2].rotate_right(19) ^ (w[i-2] >> 10);
+w[i] = w[i-16].wrapping_add(s0).wrapping_add(w[i-7]).wrapping_add(s1);
+}
+let (mut a,mut b,mut c,mut d,mut e,mut f,mut g,mut hh) =
+(h[0],h[1],h[2],h[3],h[4],h[5],h[6],h[7]);
+for i in 0..64 {
+let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+let ch = (e & f) ^ ((!e) & g);
+let t1 = hh.wrapping_add(s1).wrapping_add(ch).wrapping_add(K[i]).wrapping_add(w[i]);
+let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+laisser maj = (a & b) ^ (a & c) ^ (b & c);
+let t2 = s0.wrapping_add(maj);
+hh=g; g=f; f=e; e=d.wrapping_add(t1);
+d=c; c=b; b=a; a=t1.wrapping_add(t2);
+}
+h[0]=h[0].wrapping_add(a); h[1]=h[1].wrapping_add(b);
+h[2]=h[2].wrapping_add(c); h[3]=h[3].wrapping_add(d);
+h[4]=h[4].wrapping_add(e); h[5]=h[5].wrapping_add(f);
+h[6]=h[6].wrapping_add(g); h[7]=h[7].wrapping_add(hh);
+}
+let mut out = [0u8; 32];
+for (i, val) in h.iter().enumerate() {
+out[i*4] = ((val >> 24) & 0xff) as u8;
+out[i*4+1] = ((val >> 16) & 0xff) as u8;
+out[i*4+2] = ((val >> 8) & 0xff) as u8;
+out[i*4+3] = ( val & 0xff) as u8;
+}
+out
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+bytes.iter().fold(String::new(), |mut s, b| { write!(s, "{:02x}", b).unwrap(); s })
+}
+
+// Parse un tableau JSON de f64
+fn parse_f64_array(s: &str) -> Vec<f64> {
+let s = s.trim().trim_start_matches('[').trim_end_matches(']');
+s.split(',').filter_map(|x| x.trim().parse::<f64>().ok()).collect()
+}
+
+fn extract_array<'a>(json: &'a str, key: &str) -> &'a str {
+let needle = format!("\"{}\":", key);
+if let Some(p) = json.find(&needle) {
+let rest = &json[p + needle.len()..];
+if let Some(start) = rest.find('[') {
+let rest2 = &rest[start..];
+let mut depth = 0usize;
+for (i, c) in rest2.char_indices() {
+match c { '[' => depth += 1, ']' => { depth -= 1; if depth == 0 { return &rest2[..=i]; } }, _ => {} }
+}
+}
+}
+""
+}
+
+fn cosine(a: &[f64], b: &[f64]) -> f64 {
+if a.len() != b.len() || a.is_empty() { return 0.0; }
+let (mut dot, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64);
+for (x, y) in a.iter().zip(b.iter()) {
+dot += x * y; na += x * x; nb += y * y;
+}
+if na <= 0.0 || nb <= 0.0 { return 0.0; }
+let c = dot / (na.sqrt() * nb.sqrt());
+c.max(-1.0_f64).min(1.0_f64);
+((c + 1.0) / 2.0).clamp(0.0, 1.0)
+}
+
+fn main() {
+let mut input = String::new();
+io::stdin().read_to_string(&mut input).unwrap_or(0);
+laisser json = input.trim();
+
+// Mode hash : {"data":"<hex>"}
+if json.contains("\"data\":") {
+let data_str = json.find("\"data\":").map(|p| {
+let rest = &json[p + 7..];
+let start = rest.find('"').map(|i| i + 1).unwrap_or(0);
+let rest2 = &rest[start..];
+let end = rest2.find('"').unwrap_or(rest2.len());
+&rest2[..end]
+}).unwrap_or("");
+let bytes: Vec<u8> = data_str.as_bytes().to_vec();
+let hash = sha256(&bytes);
+println!("{\"ok\":true,\"hash\":\"{}\",\"len\":{},\"backend\":\"rust\"}}",
+to_hex(&hash), bytes.len());
+return;
+}
+
+// Mode similarité : {"a":[...],"b":[...]}
+let sa = extract_array(json, "a");
+let sb = extract_array(json, "b");
+if sa.is_empty() || sb.is_empty() {
+println!("{\"ok\":false,\"err\":\"cles a/b manquantes\",\"backend\":\"rust\"}");
+std::process::exit(1);
+}
+let va = parse_f64_array(sa);
+let vb = parse_f64_array(sb);
+if va.is_empty() || vb.is_empty() {
+println!("{\"ok\":false,\"err\":\"vecteurs vides\",\"backend\":\"rust\"}");
+std::process::exit(1);
+}
+let sim = cosine(&va, &vb);
+// Hash de sécurité sur le vecteur a
+let a_bytes: Vec<u8> = sa.bytes().collect();
+let hash = to_hex(&sha256(&a_bytes));
+println!("{\"ok\":true,\"similarity\":{:.6},\"hash_a\":\"{}\",\"dim\":{},\"backend\":\"rust\"}}",
+sim, &hash[..16], va.len());
+}
+RUSTEOF
+log_ok "Source Rust eneme : ${SRC_DIR}/faceid_probe.rs"
+}
+
+build_rust() {
+if ! cmd_exists rustc; then
+log_warn "rustc non trouvé — probe Rust désactivée"
+Retour 1
+fi
+log_info "Compilation Rust..."
+rustc -O -edition 2021 \
+"${SRC_DIR}/faceid_probe.rs" \
+-o "${BUILD_DIR}/faceid_rust" \
+2> "${LOGS_DIR}/rust_build.log"
+if [[ -x "${BUILD_DIR}/faceid_rust" ]]; then
+log_ok "Binaire Rust prêt : ${BUILD_DIR}/faceid_rust"
+return 0
+d'autre
+log_warn "Compilation Rust échouée — voir ${LOGS_DIR}/rust_build.log"
+Retour 1
+fi
+}
+
+# ════════════════════════════════════════════════════��
+# SEGMENT GO — Démon health-check + probe HTTP légère
+# ════════════════════════════════════════════════════��
+generate_go() {
+cat > "${SRC_DIR}/faceid_health.go" << 'GOEOF'
+// NEXUS FACE ID HEALTH DAEMON v3.0 (Go)
+// Démon de surveillance : ping Face ID toutes les 30s,
+// expose /health sur port+1 (9091), log les anomalies.
+// Compile : go build -o faceid_go faceid_health.go
+// Auteur : Aissa Mohammedi (DGK)
+
+paquet principal
+
+import (
+"encoding/json"
+"fmt"
+"io"
+"log"
+"net/http"
+"os"
+"strconv"
+"sync"
+"time"
+)
+
+Const (
+Version = "3.0.0"
+HealthPort = 9091
+PingTarget = "http://127.0.0.1:9090/api/status"
+PingEvery = 30 * time.Second
+)
+
+type State struct {
+mu sync.RWMutex
+LastPing time.Time
+LastOK bool
+LatencyMs int64
+PingCount int64
+ErrorCount int64
+FaceCount int
+Uptime time.Time
+}
+
+func (s *State) record(ok bool, ms int64, faces int) {
+s.mu.Lock(); defer s.mu.Unlock()
+s.LastPing = time.Now()
+s.LastOK = ok
+s.LatencyMs = ms
+s.PingCount++
+if !ok { s.ErrorCount++ }
+s.FaceCount = faces
+}
+
+func (s *State) snapshot() map[string]interface{} {
+s.mu.RLock(); defer s.mu.RUnlock()
+return map[string]interface{}{
+"version": Version,
+"ok": s.LastOK,
+"latency_ms": s.LatencyMs,
+"ping_count": s.PingCount,
+"error_count": s.ErrorCount,
+"face_count": s.FaceCount,
+"uptime_s": int64(time.Since(s.Uptime).Seconds()),
+"last_ping": s.LastPing.Format(time.RFC3339),
+"backend": "go",
+}
+}
+
+var state = &State{Uptime: time.Now()}
+
+func ping() {
+c := &http.Client{Timeout: 8 * time.Second}
+t0 := time.Now()
+resp, err := c.Get(PingTarget)
+ms := time.Since(t0).Milliseconds()
+Si errez ! = nil {
+log.Printf("[PING] FAIL %s : %v\n", PingTarget, err)
+state.record(false, ms, 0)
+return
+}
+defer resp.Body.Close()
+body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+var j map[string]interface{}
+json.Unmarshal(body, &j)
+faces := 0
+if v, ok := j["visages"]; ok {
+if f, ok := v.(float64); ok { faces = int(f) }
+}
+state.record(resp.StatusCode == 200, ms, faces)
+log.Printf("[PING] OK %dms faces=%d\n", ms, faces)
+}
+
+func loopPing() {
+ping()
+for range time.Tick(PingEvery) { ping() }
+}
+
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+w.Header().Set("Content-Type", "application/json")
+w.Header().Set("Access-Control-Allow-Origin", "*")
+snap := state.snapshot()
+code := http.StatusOK
+if !state.LastOK { code = http.StatusServiceUnavailable }
+w.WriteHeader(code)
+enc := json.NewEncoder(w)
+enc.SetIndent("", " ")
+enc.Encode(snap)
+}
+
+func main() {
+port := HealthPort
+if p := os.Getenv("HEALTH_PORT"); p != "" {
+if n, err := strconv.Atoi(p); err == nil { port = n }
+}
+log.SetFlags(log.Ltime | log.Lshortfile)
+log.Printf("NEXUS Health Daemon v%s — :%d -> %s\n", Version, port, PingTarget)
+
+go loopPing()
+
+mux := http.NewServeMux()
+mux.HandleFunc("/health", healthHandler)
+mux.HandleFunc("/", healthHandler)
+
+srv := &http.Server{
+Addr: fmt.Sprintf(":%d", port),
+Handler: mux,
+ReadTimeout: 10 * time.Second,
+WriteTimeout: 10 * time.Second,
+}
+if err := srv.ListenAndServe(); err != nil {
+log.Fatalf("ListenAndServe: %v\n", err)
+}
+}
+GOEOF
+log_ok "Source Go généré : ${SRC_DIR}/faceid_health.go"
+}
+
+build_go() {
+if ! cmd_exists go; then
+log_warn "go non trouvé — démon health Go désactivé"
+Retour 1
+fi
+log_info "Compilation Go..."
+GOFLAGS="" go build -o "${BUILD_DIR}/faceid_go" \
+"${SRC_DIR}/faceid_health.go" \
+2> "${LOGS_DIR}/go_build.log"
+if [[ -x "${BUILD_DIR}/faceid_go" ]]; then
+log_ok "Binaire Go prêt : ${BUILD_DIR}/faceid_go"
+return 0
+d'autre
+log_warn "Compilation Go échoué — voir ${LOGS_DIR}/go_build.log"
+Retour 1
+fi
+}
+
+# ════════════════════════════════════════════════════��
+# SEGMENT JAVA — Gestionnaire de sessions JWT-like
+# ════════════════════════════════════════════════════��
+generate_java() {
+cat > "${SRC_DIR}/NexusSession.java" << 'JAVAEOF'
+// NEXUS FACE ID SESSION MANAGER v3.0 (Java 11+)
+// Génère et valide des tokens de session signés (HMAC-SHA256 simplifié)
+// Usage : java NexusSession gen <visage> <duree_sec>
+// java NexusSession vérifier <jeton>
+// java NexusSession list <sessions_file>
+// Stdlib pure (javax.crypto disponible partout en JDK)
+// Auteur : Aissa Mohammedi (DGK)
+
+import java.security.*;
+import java.security.spec.*;
+import java.util.*;
+import java.io.*;
+import java.nio.file.*;
+import java.nio.charset.StandardCharsets;
+import javax.crypto.*;
+import javax.crypto.spec.*;
+import java.time.*;
+import java.time.format.*;
+
+public class NexusSession {
+static final String VERSION = "3.0.0";
+static final String SECRET = System.getenv().getOrDefault("NEXUS_SESSION_SECRET",
+"nexus-faceid-omega-secret-key-2026");
+static final String ALGO = "HmacSHA256";
+static final DateTimeFormatter ISO = DateTimeFormatter.ISO_INSTANT;
+
+// Génère un token : base64(header.payload).signature
+static String generate(String visage, long dureeS) throws Exception {
+String sid = UUID.randomUUID().toString().replace("-", "").substring(0, 16);
+long created = Instant.now().getEpochSecond();
+long expires = created + dureeS;
+String payload = String.format(
+"{\"sid\":\"%s\",\"v\":\"%s\",\"iat\":%d,\"exp\":%d,\"ver\":\"%s\"}",
+sid, visage, created, expires, VERSION);
+Chaîne encodée = Base64.getUrlEncoder().sansPadding()
+.encodeToString(payload.getBytes(StandardCharsets.UTF_8));
+String sig = hmac(encoded);
+return encoded + "." + sig;
+}
+
+// Vérifie un token, retourne le payload ou null si invalide/expiré
+static String verify(String token) throws Exception {
+String[] parts = token.split("\\.", 2);
+if (parts.length != 2) return null;
+String encoded = parts[0];
+String sig = parts[1];
+if (!hmac(encoded).equals(sig)) return null; // signature invalide
+byte[] bytes = Base64.getUrlDecoder().decode(encoded);
+String payload = new String(bytes, StandardCharsets.UTF_8);
+// Extraire exp
+int expIdx = payload.indexOf("\"exp\":");
+if (expIdx < 0) return null;
+String after = payload.substring(expIdx + 6);
+long exp = Long.parseLong(after.replaceAll("[^0-9]", "").substring(0, 10));
+if (Instant.now().getEpochSecond() > exp) return null; // expiré
+return payload;
+}
+
+statique String hmac(String data) lance Exception {
+Mac mac = Mac.getInstance(ALGO);
+mac.init(new SecretKeySpec(SECRET.getBytes(StandardCharsets.UTF_8), ALGO));
+byte[] raw = mac.doFinal(data.getBytes(StandardCharsets.UTF_8));
+return Base64.getUrlEncoder().withoutPadding().encodeToString(raw).substring(0, 32);
+}
+
+public static void main(String[] args) throws Exception {
+if (args.length < 1) {
+System.out.println("{\"ok\":false,\"err\":\"usage: gen|verify|list\"}");
+System.exit(1);
+}
+switch (args[0]) {
+case "gen" -> {
+String visage = args.length > 1 ? args[1] : "unknown";
+long duree = args.length > 2 ? Long.parseLong(args[2]) : 300L;
+String tok = generate(visage, duree);
+System.out.printf("{\"ok\":true,\"token\":\"%s\","
++ "\"visage\":\"%s\",\"duree_s\":%d,\"backend\":\"java\"}%n",
+tok, visage, duree);
+}
+case "verify" -> {
+String tok = args.length > 1 ? args[1] : "";
+Chaîne p = verify(tok);
+if (p != null) {
+System.out.printf("{\"ok\":true,\"valide\":true,\"payload\":%s,\"backend\":\"java\"}%n", p);
+} else {
+System.out.println("{\"ok\":true,\"valide\":false,\"backend\":\"java\"}");
+}
+}
+case "list" -> {
+String file = args.length > 1 ? args[1] : "";
+if (file.isEmpty() || !Files.exists(Paths.get(file))) {
+System.out.println("{\"ok\":false,\"err\":\"fichier introuvable\"}");
+System.exit(1);
+}
+String content = Files.readString(Paths.get(file));
+System.out.printf("{\"ok\":true,\"content\":%s,\"backend\":\"java\"}%n",
+content.isEmpty() ? "{}" : content);
+}
+default -> {
+System.out.println("{\"ok\":false,\"err\":\"commande inconnue\"}");
+System.exit(1);
+}
+}
+}
+}
+JAVAEOF
+log_ok "Source Java généré : ${SRC_DIR}/NexusSession.java"
+}
+
+build_java() {
+if ! cmd_exists javac; then
+log_warn "javac non trouvé — gestionnaire de sessions Java désactivé"
+Retour 1
+fi
+log_info "Compilation Java..."
+javac -d "${BUILD_DIR}" "${SRC_DIR}/NexusSession.java" \
+2> "${LOGS_DIR}/java_build.log"
+si [ [ -f "${BUILD_DIR}/NexusSession.class" ]; puis
+log_ok "Classe Java prête : ${BUILD_DIR}/NexusSession.class"
+return 0
+d'autre
+log_warn "Compilation Java échouée — voir ${LOGS_DIR}/java_build.log"
+Retour 1
+fi
+}
+
+# ════════════════════════════════════════════════════��
+# SEGMENT PYTHON — Serveur Face ID principal (port 9090)
+# Cœur complet : empreinte multi-blocs, cosinus pondéré, sessions,
+# UI web responsive (iOS Safari / Android Chrome / PC / Linux)
+# ════════════════════════════════════════════════════��
+generate_python() {
+cat > "${SRC_DIR}/faceid_server.py" << 'PYEOF'
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# NEXUS FACE ID SERVER v3.0.0 -- port 9090
+Auteur : Aissa Mohammedi (DGK)
+# Licence : NEXUS-OPEN-2.0
+# Compat : Python 3.7+ / Linux / macOS / Windows WSL / Android Termux / iOS a-Shell
+import os, re, json, time, math, uuid, hashlib, datetime, threading, socket
+import urllib.parse, subprocess
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
+
+VERSION = '3.0.0'
+AUTEUR = 'Aissa Mohammedi (DGK)'
+PORT = int(os.environ.get('NEXUS_PORT', '9090'))
+SEUIL_MATCH = float(os.environ.get('NEXUS_SEUIL', '0.82'))
+SEUIL_INDIV = 0.78
+TIMEOUT_SES = 300
+ANGLES = ['face', 'gauche', 'droite']
+
+BASE = os.path.join(os.path.expanduser('~'), 'Documents', 'nexus_faceid_omega')
+RESULTS = os.path.join(BASE, 'results')
+LOGS_DIR = os.path.join(BASE, 'logs')
+BUILD_DIR = os.path.join(BASE, 'build')
+LOG_FILE = os.path.join(LOGS_DIR, 'faceid.log')
+DB_FILE = os.path.join(RESULTS, 'db.json')
+SES_FILE = os.path.join(RESULTS, 'sessions.json')
+TST_FILE = os.path.join(RESULTS, 'tests.jsonl')
+for d in (BASE, RESULTS, LOGS_DIR, BUILD_DIR): os.makedirs(d, exist_ok=True)
+
+LOG_LK = threading.RLock()
+DB_LK = threading.RLock()
+
+# Backends compilés (remplis par check_backends())
+BK_CPP = ''
+BK_RUST = ''
+BK_GO = False
+BK_JAVA = ''
+
+def check_backends():
+global BK_CPP, BK_RUST, BK_GO, BK_JAVA
+cpp = os.path.join(BUILD_DIR, 'faceid_cpp')
+rust = os.path.join(BUILD_DIR, 'faceid_rust')
+go = os.path.join(BUILD_DIR, 'faceid_go')
+java = os.path.join(BUILD_DIR, 'NexusSession.class')
+BK_CPP = cpp if os.path.isfile(cpp) and os.access(cpp, os.X_OK) else ''
+BK_RUST = rust if os.path.isfile(rust) and os.access(rust, os.X_OK) else ''
+BK_GO = bool(os.path.isfile(go) and os.access(go, os.X_OK))
+BK_JAVA = os.path.dirname(java) if os.path.isfile(java) else ''
+
+def log(msg):
+ts = time.strftime('%Y-%m-%d %H:%M:%S')
+line = '[{}] {}'.format(ts, msg)
+try: print(line, flush=True)
+except: pass
+with LOG_LK:
+try:
+with open(LOG_FILE, 'a', encoding='utf-8') as f: f.write(line + '\n')
+except OSError: pass
+
+def tlog(entry):
+entry['ts'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+try:
+with open(TST_FILE, 'a', encoding='utf-8') as f:
+f.write(json.dumps(entry, ensure_ascii=False, default=str) + '\n')
+except OSError: pass
+
+def db_load():
+if os.path.exists(DB_FILE):
+try:
+with open(DB_FILE, 'r', encoding='utf-8') as f: return json.load(f)
+except: pass
+return {'visages': {}, 'total': 0}
+
+def db_save(db):
+try:
+tmp = DB_FILE + '.tmp'
+with open(tmp, 'w', encoding='utf-8') as f:
+json.dump(db, f, indent=2, ensure_ascii=False, default=str)
+os.replace(tmp, DB_FILE)
+except OSError as e: log('db_save err ' + str(e)[:80])
+
+def ses_load():
+if os.path.exists(SES_FILE):
+try:
+with open(SES_FILE, 'r', encoding='utf-8') as f: return json.load(f)
+except: pass
+return {}
+
+def ses_save(s):
+try:
+with open(SES_FILE, 'w', encoding='utf-8') as f:
+json.dump(s, f, indent=2, ensure_ascii=False, default=str)
+except OSError: pass
+
+# ─ Empreinte multi-blocs 4x256 valeurs ─
+def empreinte(data):
+try:
+n = len(data)
+if n < 500: return None
+taille, blocs = 16, []
+pour b dans la gamme(4):
+pas = max(1, n // (taille * taille * 4))
+idx = b * (n // 4)
+grid = []
+for _ in range(taille * taille):
+chunk = data[idx:idx + pas] or b'\x00'
+grid.append(sum(chunk) / len(chunk) / 255.0)
+idx += pas
+blocs.extend(grid)
+m = sum(blocs) / len(blocs)
+var = sum((x - m) ** 2 for x in blocs) / len(blocs)
+ecrt = math.sqrt(var) if var > 0 else 1.0
+norm = [(x - m) / ecrt for x in blocs]
+zones = [norm[i*256:(i+1)*256] for i in range(4)]
+mz = [sum(z)/len(z) for z in zones]
+return {'v': norm, 'zones': mz}
+except Exception as e: log('empreinte err ' + str(e)[:80]); return None
+
+def sim_python(a, b):
+if not a or not b: return 0.0
+va, vb = a.get('v'), b.get('v')
+if not va or not vb or len(va) != len(vb): return 0.0
+point = sum(x*y pour x,y en zip(va,vb))
+na = math.sqrt(sum(x*x pour x en va))
+nb = math.sqrt(sum(y*y for y in vb))
+if na == 0 or nb == 0: return 0.0
+cos = dot / (na * nb)
+za, zb = a.get('zones',[]), b.get('zones',[])
+if za and zb and len(za)==len(zb):
+diff = sum(abs(x-y) for x,y in zip(za,zb)) / len(za)
+cos *= (1.0 - min(diff*0.5, 0.3))
+return max(0.0, min(1.0, (cos+1.0)/2.0))
+
+def sim_cpp(a, b):
+"""Utilise le binaire C++ si disponible."""
+if not BK_CPP: return None
+try:
+payload = json.dumps({'a': a.get('v',[]), 'b': b.get('v',[])})
+r = subprocess.run([BK_CPP], input=payload.encode(), capture_output=True, timeout=5)
+d = json.loads(r.stdout.decode())
+if d.get('ok'): return d.get('similarity', 0.0)
+except: pass
+return None
+
+def similarite(a, b):
+s = sim_cpp(a, b)
+if s is not None: return s
+return sim_python(a, b)
+
+def backend_info():
+return {
+'cpp': bool(BK_CPP),
+'rust': bool(BK_RUST),
+'go': BK_GO,
+'java': bool(BK_JAVA),
+}
+
+# ─ CRUD visages ─
+def enregistrer(nom, angle, img_bytes):
+nom = (nom or '').strip()[:80]
+if not nom: return {'ok': False, 'err': 'nom requis'}
+if angle not in ANGLES: return {'ok': False, 'err': 'angle invalide'}
+if len(img_bytes) < 500: return {'ok': False, 'err': 'image trop petite'}
+emp = empreinte(img_bytes)
+if not emp: return {'ok': False, 'err': 'empreinte impossible'}
+with DB_LK:
+db = db_load()
+eid = next((k for k,v in db['visages'].items()
+if v.get('nom','').lower()==nom.lower()), None)
+if not eid:
+eid = uuid.uuid4().hex[:12]
+db['visages'][eid] = {
+'id': eid, 'nom': nom, 'angles': {},
+'created': datetime.datetime.now(datetime.timezone.utc).isoformat()
+}
+v = db['visages'][eid]
+v['angles'][angle] = {
+'empreinte': emp, 'taille': len(img_bytes),
+'sha256': hashlib.sha256(img_bytes).hexdigest()[:16],
+'ts': datetime.datetime.now(datetime.timezone.utc).isoformat()
+}
+v['updated'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+v['nb_angles'] = len(v['angles'])
+db['total'] = len(db['visages'])
+db_save(db)
+log('Angle enregistre : {}/{} ({}/3)'.format(nom, angle, v['nb_angles']))
+return {'ok': True, 'id': eid, 'nom': nom, 'angle': angle,
+'nb_angles': v['nb_angles'], 'complet': v['nb_angles']==3}
+
+def verifier(img_bytes):
+if len(img_bytes) < 500: return {'ok': False, 'err': 'image trop petite', 'match': False}
+emp = empreinte(img_bytes)
+if not emp: return {'ok': False, 'err': 'empreinte impossible', 'match': False}
+db = db_load()
+res = []
+for vid, v in db['visages'].items():
+angles = v.get('angles', {})
+if not angles: continue
+scores = []
+for angle, data in angles.items():
+e = data.get('empreinte')
+if e: scores.append((angle, similarite(emp, e)))
+if not scores: continue
+tot = pw = 0.0
+detail = {}
+for angle, s in scores:
+p = 2.0 if angle == 'face' else 1.0
+tot += s * p; pw += p; detail[angle] = round(s, 4)
+sf = tot/pw if pw > 0 else 0.0
+res.append({'id': vid, 'nom': v.get('nom','?'), 'score': round(sf,4),
+'detail': detail, 'nb_angles': len(scores)})
+if not res: return {'ok': True, 'match': False, 'score': 0.0, 'message': 'aucun visage'}
+res.sort(key=lambda x: -x'score'])
+best = res[0]; ms = best['score']
+ok_ind = any(s >= SEUIL_INDIV for s in best['detail'].values())
+match = ms >= SEUIL_MATCH and ok_ind
+verdict = 'connu' if match else ('faible_confiance' if ms >= SEUIL_INDIV else 'inconnu')
+log(('MATCH ' + best['nom'] + ' score=' + str(round(ms,3))) if match
+else 'NON MATCH best=' + str(round(ms,3)))
+return {'ok': True, 'match': match, 'verdict': verdict,
+'score': round(ms,4), 'seuil': SEUIL_MATCH,
+'nom': best['nom'] if match else None,
+'id': best['id'] if match else None,
+'detail': best.get('detail', {}),
+'classement': res[:5], 'backends': backend_info()}
+
+def lister():
+db = db_load()
+return sorted([{'id': vid, 'nom': v.get('nom','?'),
+'created': v.get('created','?'), 'updated': v.get('updated','?'),
+'nb_angles': len(v.get('angles',{})),
+'angles': list(v.get('angles',{}).keys()),
+'complet': len(v.get('angles',{}))==3}
+for vid,v in db['visages'].items()],
+key=lambda x: x.get('created',''))
+
+def supprimer(vid):
+vid = re.sub(r'[^a-f0-9]','',vid or '')[:16]
+with DB_LK:
+db = db_load()
+if vid in db['visages']:
+del db['visages'][vid]; db['total'] = len(db['visages']); db_save(db)
+log('Supprime : ' + vid); return {'ok': True, 'supprime': vid}
+retour {'ok': Faux, 'err': 'introuvable'}
+
+def supprimer_tout():
+with DB_LK: db_save({'visages': {}, 'total': 0})
+log('Tout supprimé'); return {'ok': True}
+
+# ─ Sessions ─
+def ses_creer(visage, duree=TIMEOUT_SES):
+sid = uuid.uuid4().hex
+now = time.time()
+ses = {k:v for k,v in ses_load().items() if v.get('expire',0) > now}
+ses[sid] = {'id': sid, 'visage': visage, 'created': now, 'expire': now+duree}
+ses_save(ses)
+# Optionnel : déléguer à Java si disponible
+if BK_JAVA:
+try:
+r = subprocess.run(['java', '-cp', BK_JAVA, 'NexusSession', 'gen', visage, str(duree)],
+capture_output=True, timeout=5)
+d = json.loads(r.stdout.decode())
+if d.get('ok'): return {'ok': True, 'session': sid, 'token': d.get('token',''), 'expire_dans': duree}
+except: pass
+return {'ok': True, 'session': sid, 'expire_dans': duree}
+
+def ses_verifier(sid):
+if not sid: return {'ok': False, 'err': 'sid manquant', 'valide': False}
+sid = re.sub(r'[^a-f0-9]', '', sid)[:64]
+ses = ses_load()
+s = ses.get(sid)
+if not s: return {'ok': True, 'valide': False, 'message': 'inconnue'}
+if s.get('expire',0) < time.time():
+del ses[sid]; ses_save(ses)
+return {'ok': True, 'valide': False, 'message': 'expirée'}
+return {'ok': True, 'valide': True, 'visage': s['visage'],
+'expire_dans': int(s['expire'] - time.time())}
+
+#──────────────────────────────────────────────────────────────��─────────────────────────────────────────────────────────�───────────────�─�───────�───────�──�──�
+# HTML UI — Responsive (iOS / Android / PC / Linux)
+#──────────────────────────────────────────────────────────────��─────────────────────────────────────────────────────────�───────────────�─�───────�───────�──�──�
+HTML = r"""
+<! DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#000">
+<meta name="description" content="NEXUS Face ID Omega v3.0 - Reconnaissance faciale locale, zero cloud">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="mobile-web-app-capable" content="yes">
+<title>NEXUS FACE ID OMEGA v__V__</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+:root{
+--c-primary:#00d4ff;--c-secondary:#a855f7;--c-ok:#4ade80;
+--c-err:#f87171;--c-warn:#fbbf24;--c-bg:#000;--c-card:rgba(20,20,30,0.85);
+--r:14px;--safe-top:env(safe-area-inset-top,0px);
+--safe-bottom:env(safe-area-inset-bottom,0px);
+}
+html{font-size:16px;scroll-behavior:smooth}
+body{
+background:var(--c-bg);color:#fff;
+font-family:-apple-system,BlinkMacSystemFont,'SF Pro','Segoe UI','Inter',system-ui,sans-serif;
+min-height:100dvh;min-height:100vh;
+padding-top:var(--safe-top);padding-bottom:var(--safe-bottom);
+background-image:
+radial-gradient(ellipse at 15% 15%,rgba(0,212,255,.18) 0%,transparent 55%),
+radial-gradient(ellipse at 85% 85%,rgba(168,85,247,.18) 0%,transparent 55%),
+radial-gradient(ellipse at 50% 50%,rgba(255,110,199,.07) 0%,transparent 70%);
+}
+.wrap{max-width:860px;margin:0 auto;padding:16px 14px clamp(60px,8vw,100px)}
+
+/* Logo */
+.logo{text-align:center;padding:clamp(12px,4vw,28px) 0 clamp(8px,2vw,16px)}
+.logo h1{
+font-size:clamp(28px,8vw,52px);font-weight:900;letter-spacing:-2px;
+background:linear-gradient(110deg,#fff 10%,#00d4ff 40%,#a855f7 70%,#ff6ec7);
+-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;
+filter:drop-shadow(0 0 40px rgba(0,212,255,.35));
+}
+.logo p{color:#666;font-size:clamp(8px,2.5vw,11px);letter-spacing:4px;margin-top:4px;text-transform:uppercase}
+
+/* Badges backends */
+.backends{display:flex;gap:6px;justify-content:center;flex-wrap:wrap;margin:8px 0 4px}
+.bk{padding:3px 10px;border-radius:20px;font-size:10px;font-family:monospace;
+letter-spacing:1px;text-transform:uppercase;border:1px solid;transition:all .3s}
+.bk.on{background:rgba(74,222,128,.12);border-color:#4ade80;color:#4ade80}
+.bk.off{background:rgba(255,255,255,.04);border-color:rgba(255,255,255,.15); couleur:#555}
+
+/* Cards */
+.card{
+background:var(--c-card);backdrop-filter:blur(20px);
+-webkit-backdrop-filter:blur(20px);
+border:1px solid rgba(255,255,255,.08);border-radius:var(--r);
+padding:clamp(10px,3vw,18px);margin-bottom:10px;
+}
+.card h3{color:var(--c-primary);font-size:clamp(9px,2.5vw,12px);letter-spacing:2px;
+margin-bottom:10px;text-transform:uppercase;display:flex;align-items:center;gap:6px}
+
+/* Camera */
+.camera{
+position:relative;width:100%;max-width:420px;margin:0 auto;
+aspect-ratio:1/1;background:#050a10;border-radius:20px;
+overflow:hidden;border:2px solid #1a1f2e;
+box-shadow:0 0 60px rgba(0,212,255,.15);
+}
+.camera video{width:100%;height:100%;object-fit:cover;transform:scaleX(-1);display:block}
+.camera canvas{display:none}
+.scan-grid{position:absolute;inset:0;pointer-events:none;
+background-image:linear-gradient(rgba(0,212,255,.07) 1px,transparent 1px),
+linear-gradient(90deg,rgba(0,212,255,.07) 1px,transparent 1px);
+background-size:28px 28px;border-radius:20px}
+.scan-line{position:absolute;left:0;right:0;height:2px;
+background:linear-gradient(90deg,transparent,var(--c-primary),transparent);
+box-shadow:0 0 18px var(--c-primary);
+animation:scanMove 2.8s ease-in-out infinite;pointer-events:none}
+@keyframes scanMove{0%{top:8%}50%{top:92%}100%{top:8%}}
+.face-guide{position:absolute;inset:0;pointer-events:none;
+display:flex;align-items:center;justify-content:center}
+.oval{
+width:58%;aspect-ratio:3/4;
+border:3px solid rgba(0,212,255,.85);border-radius:50%;
+box-shadow:0 0 30px rgba(0,212,255,.4),inset 0 0 30px rgba(0,212,255,.12);
+animation:glow 2.2s ease-in-out infinite;transition:all .4s
+}
+@keyframes glow{
+0%,100%{box-shadow:0 0 30px rgba(0,212,255,.4),inset 0 0 30px rgba(0,212,255,.12)}
+50%{box-shadow:0 0 55px rgba(0,212,255,.75),inset 0 0 45px rgba(0,212,255,.28)}
+}
+.oval.ok{border-color:var(--c-ok);box-shadow:0 0 40px rgba(74,222,128,.6)}
+.oval.err{border-color:var(--c-err);box-shadow:0 0 40px rgba(248,113,113,.6)}
+.corner{position:absolute;width:28px;height:28px;border-color:var(--c-primary);border-style:solid}
+.corner.tl{top:10px;left:10px;border-width:3px 0 0 3px;border-radius:7px 0 0 0}
+.corner.tr{top:10px;right:10px;border-width:3px 3px 0 0;border-radius:0 7px 0 0}
+.corner.bl{bottom:10px;left:10px;border-width:0 0 3px 3px;border-radius:0 0 0 7px}
+.corner.br{bottom:10px;right:10px;border-width:0 3px 3px 0;border-radius:0 0 7px 0}
+.ov-top{position:absolute;top:12px;left:0;right:0;text-align:center;
+color:#fff;font-family:monospace;font-size:clamp(9px,2.5vw,12px);
+letter-spacing:2px;text-shadow:0 1px 8px rgba(0,0,0,.9);pointer-events:none}
+.ov-bot{position:absolute;bottom:12px;left:0;right:0;text-align:center;
+color:var(--c-primary);font-family:monospace;font-size:clamp(9px,2.5vw,11px);
+lettre-espacement:2px;text-ombre:0 0 10px rgba(0,212,255,.8);pointer-événements:none}
+
+/* Angles */
+.angles{display:flex;gap:6px;justify-content:center;margin:10px 0}
+.angle{flex:1;padding:clamp(6px,2vw,10px);border-radius:10px;text-align:center;
+font-size:clamp(9px,2.5vw,11px);font-family:monospace;
+background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.09);transition:all .3s}
+.angle.on{background:rgba(74,222,128,.12);border-color:var(--c-ok);color:var(--c-ok)}
+.angle.cur{background:rgba(0,212,255,.12);border-color:var(--c-primary);
+color:var(--c-primary);animation:pulse 1.6s ease-in-out infinite}
+@keyframes pulse{50%{opacity:.55}}
+
+/* Inputs/Buttons */
+input,button,select{
+font-family:inherit;font-size:clamp(12px,3vw,14px);
+padding:clamp(8px,2.5vw,12px) clamp(10px,3vw,16px);
+border-radius:9px;border:1px solid rgba(255,255,255,.1);
+background:rgba(0,0,0,.45);color:#fff;outline:none;
+width:100%;transition:all .2s;touch-action:manipulation;
+}
+input:focus{border-color:var(--c-primary);box-shadow:0 0 0 2px rgba(0,212,255,.2)}
+button{
+background:linear-gradient(135deg,var(--c-primary),var(--c-secondary));
+color:#000;font-weight:700;cursor:pointer;border:none;
+-webkit-appearance:none;appearance:none;
+}
+bouton:active{transform:scale(.97)}
+button.sec{background:rgba(255,255,255,.07);color:#fff}
+button.danger{background:var(--c-err);color:#000}
+button:disabled{opacity:.38;cursor:not-allowed;transform:none}
+.actions{display:grid;grid-template-columns:repeat(auto-fit,minmax(100px,1fr));gap:7px;margin:10px 0}
+select{margin-bottom:8px;-webkit-appearance:none;appearance:none}
+
+/* Resultats */
+.res{text-align:center;padding:clamp(10px,3vw,16px);border-radius:12px;
+margin-top:10px;font-family:monospace;font-size:clamp(11px,3vw,14px);
+font-weight:600;display:none;line-height:1.6;transition:all .3s}
+.res.on{display:block}
+.res.oui{background:rgba(74,222,128,.12);color:var(--c-ok);border:1px solid var(--c-ok)}
+.res.non{background:rgba(248,113,113,.12);color:var(--c-err);border:1px solid var(--c-err)}
+.res.att{background:rgba(251,191,36,.12);color:var(--c-warn);border:1px solid var(--c-warn)}
+
+/* Liste */
+.row{display:flex;justify-content:space-between;align-items:center;
+padding:clamp(6px,2vw,9px) 0;font-size:clamp(10px,2.5vw,12px);
+font-family:monospace;border-bottom:1px solid rgba(255,255,255,.05);gap:8px}
+.row:last-child{border:none}
+.pill{display:inline-block;padding:2px 7px;border-radius:10px;font-size:10px;
+font-family:monospace;background:rgba(0,212,255,.13);color:var(--c-primary);margin-right:3px}
+.pill.g{background:rgba(74,222,128,.13);color:var(--c-ok)}
+.pill.r{background:rgba(248,113,113,.13);color:var(--c-err)}
+.pill.y{background:rgba(251,191,36,.13);color:var(--c-warn)}
+.pill.p{background:rgba(168,85,247,.13);color:var(--c-secondary)}
+pre{
+background:rgba(0,0,0,.55);padding:10px;border-radius:9px;
+color:#a5f3fc;font-family:monospace;font-size:clamp(9px,2.2vw,11px);
+overflow-x:auto;white-space:pre-wrap;word-break:break-all;
+border-left:2px solid var(--c-primary);max-height:240px;overflow-y:auto;
+}
+.empty{text-align:center;padding:22px;color:#444;font-size:13px}
+
+/* Score bar */
+.score-bar{height:5px;border-radius:3px;margin-top:6px;
+background:linear-gradient(90deg,var(--c-err),var(--c-warn),var(--c-ok));
+clip-path:inset(0 calc(100% - __PCT__%) 0 0);transition:clip-path .5s}
+
+/* Dark mode (déjà dark) */
+@media(prefers-color-scheme:light){
+body{background:#0a0a12}
+}
+/* Tablette / PC */
+@media(min-width:640px){
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+}
+</style></head><body>
+<div class="wrap">
+<div class="logo">
+<h1>FACE ID OMEGA</h1>
+<p>Scan 3 Angles · Zero Cloud · v__V__ · Port 9090</p>
+</div>
+
+<!-- Backends -->
+<div class="backends">
+<span class="bk off" id="bk-py">✓ Python</span>
+<span class="bk off" id="bk-cpp">C++17</span>
+<span class="bk off" id="bk-rust">Rust</span>
+<span class="bk off" id="bk-go">Go</span>
+<span class="bk off" id="bk-java">Java</span>
+</div>
+
+<!-- Camera -->
+<div class="card">
+<h3>&#128247; Camera</h3>
+<div class="camera" id="cam">
+<video id="vid" autoplay playsinline muted></video>
+<canvas id="cnv"></canvas>
+<div class="scan-grid"></div>
+<div class="scan-line"></div>
+<div class="face-guide"><div class="oval" id="oval"></div></div>
+<div class="corner tl"></div><div class="corner tr"></div>
+<div class="corner bl"></div><div class="corner br"></div>
+<div class="ov-top" id="ov-top"></div>
+<div class="ov-bot" id="ov-bot">CAMERA INACTIVE</div>
+</div>
+<div class="actions">
+<button class="sec" onclick="startCam()">&#9654; Activer</button>
+<button class="sec" onclick="flipCam()">&#8635; Basculer</button>
+<button class="danger" onclick="stopCam()">&#9632; Arrêter</button>
+</div>
+</div>
+
+<!-- Enregistrement -->
+<div class="card">
+<h3>&#128100; Enregistrer (3 angles)</h3>
+<input id="nom" placeholder="Ton nom / prénom" autocomplete="name"/>
+<select id="lang-sel" onchange="setLang(this.value)" style="margin-top:6px">
+<option value="fr">Français — Guide face / gauche / droite</option>
+<option value="en">English — Guide front / left / right</option>
+<option value="ar">عربي — واجهة / يسار / يمين</option>
+</select>
+<div class="angles">
+<div class="angle" id="a-face">1. <span id="lbl-face">Face</span></div>
+<div class="angle" id="a-gauche">2. <span id="lbl-gauche">Gauche</span></div>
+<div class="angle" id="a-droite">3. <span id="lbl-droite">Droite</span></div>
+</div>
+<div class="actions">
+<button id="btn-cap" onclick="captureAngle()">&#128248; Capturer <span id="cur-lbl">FACE</span></button>
+<button class="sec" onclick="resetAng()">&#8635; Reset</button>
+</div>
+<div class="res" id="r-enreg"></div>
+</div>
+
+<!-- Vérification -->
+<div class="card">
+<h3>&#128272; Vérifier</h3>
+<div class="actions">
+<button onclick="verifier()">&#128247; Scanner</button>
+<button class="sec" onclick="verAuto()">&#9654; Continu (3s)</button>
+</div>
+<div class="res" id="r-verif"></div>
+<pre id="det-verif" style="margin-top:8px;display:none"></pre>
+</div>
+
+<!-- Liste -->
+<div class="card">
+<h3>&#128101; Visages</h3>
+<div id="liste" class="empty">Chargement...</div>
+<div class="actions" style="margin-top:8px">
+<button class="danger" onclick="delAll()">&#128465; Tout supprimer</button>
+</div>
+</div>
+
+<!-- Système -->
+<div class="card">
+<h3>&#9881;&#65039; Système</h3>
+<div id="sys" class="empty">Chargement...</div>
+</div>
+</div>
+
+<script>
+/* ─── GLOBALS ─── */
+let stream=null,facing='user',autoT=null;
+let angleCur='face',anglesDone={face:false,gauche:false,droite:false};
+const LABELS={
+fr:{face:'Face',gauche:'Gauche',droite:'Droite'},
+en:{face:'Front',gauche:'Left',droite:'Right'},
+ar:{face:'واجهة',gauche:'يسار',droite:'يمين'}
+};
+let lang='fr';
+
+fonction setLang(l){lang=l;updateLabels();}
+function updateLabels(){
+const L=LABELS[lang]||LABELS.fr;
+document.getElementById('lbl-face').textContent=L.face;
+document.getElementById('lbl-gauche').textContent=L.gauche;
+document.getElementById('lbl-droite').textContent=L.droite;
+document.getElementById('cur-lbl').textContent=L[angleCur].toUpperCase();
+}
+
+/* ─── CAMERA ─── */
+async function startCam(){
+try{
+if(stream)stream.getTracks().forEach(t=>t.stop());
+stream=await navigator.mediaDevices.getUserMedia({
+video:{facingMode:facing,width:{ideal:720},height:{ideal:720}},audio:false
+});
+const v=document.getElementById('vid');
+v.srcObject=stream;
+v.style.transform=facing==='user'?'scaleX(-1)':'scaleX(1)';
+setBot('CAMERA ACTIVE');
+}catch(e){setBot('ERREUR: '+e.message);}
+}
+function flipCam(){facing=facing==='user'?'environment':'user';startCam();}
+function stopCam(){
+if(stream){stream.getTracks().forEach(t=>t.stop());stream=null;}
+document.getElementById('vid').srcObject=null;
+setBot('CAMERA INACTIVE');
+}
+fonction setBot(t){document.getElementById('ov-bot').textContent=t;}
+fonction setTop(t){document.getElementById('ov-top').textContent=t;}
+
+function capture(){
+const v=document.getElementById('vid');
+const c=document.getElementById('cnv');
+if(!v.videoWidth)return null;
+c.width=320;c.height=320;
+const ctx=c.getContext('2d');
+ctx.drawImage(v,0,0,320,320);
+return c.toDataURL('image/jpeg',0.88);
+}
+function dataToBlob(d){
+const arr=d.split(','),mime=arr[0].match(/:([^;]+)/)[1];
+const bin=atob(arr[1]),bytes=new Uint8Array(bin.length);
+for(let i=0;i<bin.length;i++)bytes[i]=bin.charCodeAt(i);
+return new Blob([bytes],{type:mime});
+}
+
+function showRes(id,html,cls){
+const el=document.getElementById(id);
+el.className='res on '+cls;el.innerHTML=html;
+}
+
+/* ─── ANGLES ─── */
+function nextAngle(){
+if(!anglesDone.face)return 'face';
+if(!anglesDone.gauche)return 'gauche';
+if(!anglesDone.droite)return 'droite';
+return null;
+}
+function updAngles(){
+['face','gauche','droite'].forEach(a=>{
+const el=document.getElementById('a-'+a);
+el.className='angle'+(anglesDone[a]?' on':a===angleCur?' cur':'');
+});
+document.getElementById('cur-lbl').textContent=
+(LABELS[lang]||LABELS.fr)[angleCur].toUpperCase();
+}
+function resetAng(){
+angleCur='face';anglesDone={face:false,gauche:false,droite:false};
+updAngles();document.getElementById('r-enreg').className='res';
+}
+
+async function captureAngle(){
+const nom=document.getElementById('nom').value.trim();
+if(!nom){alert('Saisis ton nom');return;}
+const d=capture();
+if(!d){alert('Camera pas prête');return;}
+showRes('r-enreg','Capture '+angleCur.toUpperCase()+'...','att');
+try{
+const r=await fetch('/api/enregistrer?nom='+encodeURIComponent(nom)
++'&angle='+encodeURIComponent(angleCur),{method:'POST',body:dataToBlob(d)});
+const j=await r.json();
+if(!j.ok){showRes('r-enreg','&#10007; '+esc(j.err||'?'),'non');return;}
+anglesDone[angleCur]=true;
+const nx=nextAngle();
+if(nx){
+angleCur=nx;
+const L=LABELS[lang]||LABELS.fr;
+showRes('r-enreg','&#10003; '+j.angle.toUpperCase()+' OK ('+j.nb_angles+'/3)<br>'
++'&#10140; Tourne : <b>'+L[nx].toUpperCase()+'</b>','oui');
+}else{
+showRes('r-enreg','&#10003;&#10003;&#10003; COMPLET (3/3)<br>Passe au test.','oui');
+}
+updAngles();loadList();
+}catch(e){showRes('r-enreg','&#10007; Réseau : '+e.message,'non');}
+}
+
+/* ─── VÉRIFICATION ─── */
+async function verifier(){
+const d=capture();if(!d){alert('Camera pas prête');return;}
+showRes('r-verif','Scan...','att');
+document.getElementById('det-verif').style.display='none';
+const t0=Date.now();
+try{
+const r=await fetch('/api/verifier',{method:'POST',body:dataToBlob(d)});
+const j=await r.json();
+const dt=Date.now()-t0;
+if(!j.ok){showRes('r-verif','&#10007; '+esc(j.err||'?'),'non');return;}
+if(j.match){
+const pct=(j.score*100).toFixed(1);
+showRes('r-verif','&#10003; CONNU — <b>'+esc(j.nom)+'</b><br>'
++'Confiance : '+pct+'% (seuil '+(j.seuil*100).toFixed(0)+'%)<br>'
++'Temps : '+dt+' ms','oui');
+await fetch('/api/session/creer',{method:'POST',
+headers:{'Content-Type':'application/json'},
+body:JSON.stringify({visage:j.nom})});
+}else{
+const pct=(j.score*100).toFixed(1);
+showRes('r-verif','&#10007; INCONNU<br>Meilleur : '+pct
++'% (seuil '+(j.seuil*100).toFixed(0)+'%)<br>Temps : '+dt+' ms','non');
+}
+const det=document.getElementById('det-verif');
+det.style.display='block';det.textContent=JSON.stringify(j,null,2);
+updateBadges(j.backends||{});
+}catch(e){showRes('r-verif','&#10007; Réseau : '+e.message,'non');}
+}
+
+function verAuto(){
+if(autoT){clearInterval(autoT);autoT=null;setBot('CAMERA ACTIVE');return;}
+setBot('TEST CONTINU (3s)');verifier();
+autoT=setInterval(verifier,3000);
+}
+
+/* ─── LISTE ─── */
+fonction async loadList(){
+const el=document.getElementById('liste');
+Try{
+const r=await fetch('/api/liste');
+const j=await r.json();
+if(!j.items||!j.items.length){
+el.innerHTML='<div class="empty">Aucun visage enregistré</div>';return;
+}
+el.innerHTML=j.items.map(v=>{
+const c=v.complet?'g':'y';
+const l=v.nb_angles+'/3 angles';
+return `<div class="row">
+<span><b>${esc(v.nom)}</b>
+<span class="pill">${esc(v.id)}</span>
+<span class="pill ${c}">${l}</span>
+</span>
+<button class="danger" style="width:auto;padding:4px 9px;font-size:11px"
+onclick="del('${esc(v.id)}')">&#10005;</button>
+</div>`;
+}).join('');
+}catch(e){el.innerHTML='<div class="empty">Erreur : '+e.message+'</div>';}
+}
+
+async function del(vid){
+if(!confirm('Supprimer ?'))return;
+await fetch('/api/supprimer?id='+encodeURIComponent(vid),{method:'POST'});
+loadList();
+}
+async function delAll(){
+if(!confirm('Supprimer TOUS ?'))return;
+await fetch('/api/supprimer_tout',{method:'POST'});loadList();
+}
+
+/* ─── SYSTÈME ─── */
+async function loadSys(){
+const el=document.getElementById('sys');
+Try{
+const r=await fetch('/api/status');
+const j=await r.json();
+updateBadges(j.backends||{});
+el.innerHTML=Object.entries(j).map(([k,v])=>
+`<div class="row"><span>${esc(k)}</span><span><b>${esc(String(v))}</b></span></div>`
+).join('');
+}catch(e){el.textContent='Erreur : '+e.message;}
+}
+
+function updateBadges(bk){
+document.getElementById('bk-py').className='bk on';
+setB('bk-cpp', bk.cpp);setB('bk-rust',bk.rust);
+setB('bk-go', bk.go); setB('bk-java',bk.java);
+}
+fonction setB(id,on){document.getElementById(id).className='bk '+(on?' on':'off');}
+
+fonction esc(t){
+const d=document.createElement('div');
+d.textContent=(t==null?'':String(t));return d.innerHTML;
+}
+
+/* Init */
+updAngles();loadList();loadSys();
+setInterval(loadSys,30000);
+setInterval(()=>{
+if(stream&&!autoT)setTop('FACE DETECTION ACTIVE');
+},1200);
+</script></body></html>
+"""
+
+# ─ Handler HTTP ─
+class H(BaseHTTPRequestHandler):
+server_version = 'NexusFaceIDOmega/' + VERSION
+protocol_version = 'HTTP/1.1'
+def lm(self,*a): pass
+def _send(self,code,body,ct='text/html;charset=utf-8'):
+if isinstance(body,str): body=body.encode('utf-8')
+try:
+self.send_response(code)
+self.send_header('Content-Type',ct)
+self.send_header('Content-Length',str(len(body)))
+self.send_header('Access-Control-Allow-Origin','*')
+self.send_header('Cache-Control','no-store')
+self.end_headers(); self.wfile.write(body)
+except (BrokenPipeError,ConnectionResetError): pass
+def _json(self,code,obj): self._send(code,json.dumps(obj,indent=2,ensure_ascii=False,default=str),'application/json;charset=utf-8')
+def _body(self,mx=20_000_000):
+try: n=int(self.headers.get('Content-Length','0') or '0')
+except: n=0
+return self.rfile.read(n) if 0 < n <= mx else b''
+def _parse(self):
+p=urllib.parse.urlparse(self.path); return p.path,urllib.parse.parse_qs(p.query)
+def do_GET(self):
+path,qs=self._parse()
+if path in ('/','/index.html'):
+return self._send(200,HTML.replace('__V__',VERSION))
+if path=='/api/status':
+db=db_load(); ses=ses_load(); now=time.time()
+actives=sum(1 for s in ses.values() if s.get('expire',0)>now)
+return self._json(200,{'ok':True,'version':VERSION,'auteur':AUTEUR,
+'port':PORT,'visages':db.get('total',0),'sessions_actives':actives,
+'seuil_match':SEUIL_MATCH,'seuil_individuel':SEUIL_INDIV,
+'angles':ANGLES,'backends':backend_info()})
+if path=='/api/liste': return self._json(200,{'ok':True,'items':lister()})
+if path=='/api/session/verifier':
+return self._json(200,ses_verifier(qs.get('sid',[''])[0]))
+if path='/api/backends': return self._json(200,{'ok':True,'backends':backend_info()})
+return self._json(404,{'ok':False,'err':'route inconnue'})
+def do_POST(self):
+path,qs=self._parse()
+if path=='/api/enregistrer':
+nom=qs.get('nom',[''])[0]; angle=qs.get('angle',['face'])[0]
+res=enregistrer(nom,angle,self._body())
+tlog({'action':'enregistrer','nom':nom,'angle':angle,'resultat':res})
+return self._json(200,res)
+if path=='/api/verifier':
+res=verifier(self._body()); tlog({'action':'verifier','resultat':res})
+return self._json(200,res)
+if path=='/api/supprimer': return self._json(200,supprimer(qs.get('id',[''])[0]))
+if path=='/api/supprimer_tout': return self._json(200,supprimer_tout())
+if path=='/api/session/creer':
+data=json.loads(self._body().decode('utf-8','ignore') or '{}')
+return self._json(200,ses_creer(data.get('visage','?'),int(data.get('duree',TIMEOUT_SES))))
+if path=='/api/session/supprimer':
+data=json.loads(self._body().decode('utf-8','ignore') or '{}')
+sid=re.sub(r'[^a-f0-9]','',data.get('sid',''))[:64]
+ses=ses_load()
+if sid in ses: del ses[sid]; ses_save(ses)
+return self._json(200,{'ok':True})
+return self._json(404,{'ok':False,'err':'route inconnue'})
+def do_OPTIONS(self):
+try:
+self.send_response(204)
+self.send_header('Access-Control-Allow-Origin','*')
+self.send_header('Access-Control-Allow-Methods','GET,POST,OPTIONS')
+self.send_header('Access-Control-Allow-Headers','*')
+self.send_header('Content-Length','0'); self.end_headers()
+except: pass
+
+class Srv(ThreadingMixIn,HTTPServer):
+daemon_threads=True; allow_reuse_address=True
+
+def ip_local():
+try:
+s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+s.connect(('8.8.8.8',80)); ip=s.getsockname()[0]; s.close(); return ip
+except: return 'localhost'
+
+def main():
+check_backends()
+bk=backend_info()
+print(); print('='*78)
+print(' NEXUS FACE ID OMEGA v'+VERSION+' -- PORT '+str(PORT))
+print(' Auteur : '+AUTEUR+' | Licence : '+LICENCE)
+print('='*78)
+print()
+print(' Backends actifs :')
+print(' Python : OK (toujours actif)')
+print(' C++17 :', 'OK - cosinus rapide' if bk['cpp'] else 'non disponible')
+print(' Rust :', 'OK - hash SHA-256' if bk['rust'] else 'non disponible')
+print(' Go :', 'OK - health daemon' if bk['go'] else 'non disponible')
+print(' Java :', 'OK - sessions JWT' if bk['java'] else 'non disponible')
+print()
+ip=ip_local()
+print(' Local : http://localhost:'+str(PORT)+'/')
+print(' Reseau : http://'+ip+':'+str(PORT)+'/')
+print(' — Ouvre cette URL dans Safari/Chrome sur ton téléphone.')
+print()
+print(' 1. Active la caméra')
+print(' 2. Enregistre 3 angles (face / gauche / droite)')
+print(' 3. Lance le test : Scanner + Vérifier')
+print()
+print(' Ctrl+C pour arrêter')
+print()
+log('=== NEXUS FACE ID OMEGA v'+VERSION+' ===')
+log('Port : '+str(PORT)+' Backends : '+str(bk))
+try:
+with Srv(('0.0.0.0',PORT),H) as srv:
+log('Serveur prêt.')
+srv.serve_forever()
+except KeyboardInterrupt:
+print(); print(' Arrêté.'); print()
+except OSError as e:
+print(' Erreur port '+str(PORT)+' : '+str(e))
+
+if __name__=='__main__': main()
+PYEOF
+log_ok "Source Python généré : ${SRC_DIR}/faceid_server.py"
+}
+
+# ════════════════════════════════════════════════════��
+# MENU INTERACTIF
+# ════════════════════════════════════════════════════��
+show_menu() {
+local OS; OS=$(platform_detect)
+local IP; IP=$(ip_locale)
+printf "\n"
+printf " ${G}[1]${N} Générer tous les sources (Python / C++ / Rust / Go / Java)\n"
+printf " ${G}[2]${N} Compiler les binaires (C++ / Rust / Go / Java)\n"
+printf " ${G}[3]${N} Lancer le serveur Face ID${B} :${PORT}${N}\n"
+printf " ${Y}[4]${N} Pipeline complet (générer + compiler + lancer)\n"
+printf " ${B}[5]${N} Afficher statut backends\n"
+printf " ${B}[6]${N} Tester cosinus C++ (bench rapide)\n"
+printf " ${B}[7]${N} Tester hash Rust (sonde sécurité)\n"
+printf " ${B}[8]${N} Tester session Java (token JWT-like)\n"
+printf " ${D}[9]${N} Voir les logs\n"
+printf " ${R}[0]${N} Quitter\n"
+printf "\n"
+printf " ${D}Plateforme : ${OS} · IP LAN : ${IP}${N}\n"
+printf " ${D}URL : http://${IP}:${PORT} (navigateur de tout appareil sur le réseau)${N}\n"
+printf "\n"
+printf " Choix : "
+}
+
+status_backends() {
+printf "\n ${B}Backends disponibles :${N}\n"
+cmd_exists python3 && printf " ${G}✅ Python3${N} : %s\n" "$(python3 --version 2>&1)" \
+|| printf " ${R}❌ Python3 : non trouvé${N}\n"
+[[ -x "${BUILD_DIR}/faceid_cpp" ]] && printf " ${G}✅ C++17 : %s${N}\n" "${BUILD_DIR}/faceid_cpp" \
+|| printf " ${Y}⚠️ C++17 : non compilé${N}\n"
+[[ -x "${BUILD_DIR}/faceid_rust" ]] && printf " ${G}✅ Rust : %s${N}\n" "${BUILD_DIR}/faceid_rust" \
+|| printf " ${Y}⚠️ Rust : non compilé${N}\n"
+[[ -x "${BUILD_DIR}/faceid_go" ]] && printf " ${G}✅ Go : %s${N}\n" "${BUILD_DIR}/faceid_go" \
+|| printf " ${Y}⚠️ Go : non compilé${N}\n"
+[[ -f "${BUILD_DIR}/NexusSession.class" ]] && printf " ${G}✅ Java : %s${N}\n" "${BUILD_DIR}/NexusSession.class" \
+|| printf " ${Y}⚠️ Java : non compilé${N}\n"
+printf "\n"
+}
+
+bench_cpp() {
+if [[ ! -x "${BUILD_DIR}/faceid_cpp" ]]; then
+log_warn "Binaire C++ non disponible. Compilez d'abord (option 2)."
+return
+fi
+log_info "Bench cosinus C++17 (vecteur 1024 dim)..."
+# Génère deux vecteurs aléatoires
+python3 -c "
+import json, random, math
+n=1024
+a=[random.gauss(0,1) for _ in range(n)]
+b=[x+random.gauss(0,0.1) for x in a]
+# Normalise
+na=math.sqrt(sum(x*x for x in a)); a=[x/na for x in a]
+nb=math.sqrt(sum(x*x for x in b)); b=[x/nb for x in b]
+print(json.dumps({'a':a,'b':b}))
+" | "${BUILD_DIR}/faceid_cpp"
+}
+
+bench_rust() {
+si [ [ ! -x "${BUILD_DIR}/faceid_rust" ]; alors
+log_warn "Binaire Rust non disponible. Compilez d'abord (option 2)."
+return
+fi
+log_info "Test hash Rust SHA-256..."
+echo '{"data":"NEXUS FACE ID OMEGA v3.0.0 - Test hash securise par Aissa Mohammedi (DGK)"}' \
+| "${BUILD_DIR}/faceid_rust"
+log_info "Test similarité Rust..."
+python3 -c "
+import json, random, math
+n=1024
+a=[random.gauss(0,1) for _ in range(n)]
+b=[x+random.gauss(0,0.2) for x in a]
+na=math.sqrt(sum(x*x for x in a)); a=[x/na for x in a]
+nb=math.sqrt(sum(x*x for x in b)); b=[x/nb for x in b]
+print(json.dumps({'a':a,'b':b}))
+" | "${BUILD_DIR}/faceid_rust"
+}
+
+bench_java() {
+if [[ ! -f "${BUILD_DIR}/NexusSession.class" ]]; then
+log_warn "Classe Java non disponible. Compilez d'abord (option 2)."
+return
+fi
+if ! cmd_exists java; then
+log_warn "java (runtime) non trouvé."
+return
+fi
+log_info "Test session Java — génération token..."
+java -cp "${BUILD_DIR}" NexusSession gen "TestUser" 300
+log_info "Test session Java — vérification token invalide..."
+java -cp "${BUILD_DIR}" NexusSession verify "token_invalide_xxxx.yyyy"
+}
+
+start_go_daemon() {
+if [[ -x "${BUILD_DIR}/faceid_go" ]]; then
+log_info "Démarrage démon santé Go (port $((PORT+1)))..."
+HEALTH_PORT=$((PORT+1)) "${BUILD_DIR}/faceid_go" \
+> "${LOGS_DIR}/go_daemon.log" 2>&1 &
+GO_PID=$!
+echo "${GO_PID}" > "${BASE}/go.pid"
+log_ok "Démon Go PID=${GO_PID} — http://localhost:$((PORT+1))/health"
+fi
+}
+
+stop_daemons() {
+if [[ -f "${BASE}/go.pid" ]]; then
+local pid; pid=$(cat "${BASE}/go.pid" 2>/dev/null || echo '')
+[[ -n "$pid" ]] && kill "$pid" 2>/dev/null && log_ok "Démon Go arrêté" || true
+rm -f "${BASE}/go.pid"
+fi
+}
+
+launch_server() {
+if ! cmd_exists python3; then
+log_err "python3 requis pour le serveur principal."
+exit 1
+fi
+start_go_daemon
+log_ok "Lancement serveur Face ID sur port ${PORT}..."
+log_info "Accès : http://$(ip_locale):${PORT}/ (n'importe quel appareil du réseau)"
+NEXUS_PORT=${PORT} python3 "${SRC_DIR}/faceid_server.py"
+}
+
+# ════════════════════════════════════════════════════��
+# ENTRYPOINT PRINCIPAL
+# ════════════════════════════════════════════════════��
+main() {
+# Créer les répertoires
+mkdirs
+
+# Gestion des flags CLI
+case "${1:-}" in
+--gen)
+bannière; generate_cpp; generate_rust; generate_go; generate_java; generate_python
+log_ok "Tous les sources genres dans ${SRC_DIR}"; sortie 0 ;;
+--build)
+banner; generate_cpp; generate_rust; generate_go; generate_java
+build_cpp; build_rust; build_go; build_java
+status_backends; exit 0 ;;
+--run)
+generate_python; launch_server; exit 0 ;;
+--full)
+banner
+generate_cpp; generate_rust; generate_go; generate_java; generate_python
+build_cpp || true; build_rust || true; build_go || true; build_java || true
+status_backends; launch_server; exit 0 ;;
+--status)
+banner; status_backends; exit 0 ;;
+--version)
+echo "NEXUS FACE ID OMEGA v${VERSION}"; exit 0 ;;
+--help|-h)
+banner
+printf " ${B}Usage${N} : $0 [OPTION]\n\n"
+printf " ${G}--gen${N} Générer les sources\n"
+printf " ${G}--build${N} Générer + compiler\n"
+printf " ${G}--run${N} Lancer le serveur (port ${PORT})\n"
+printf " ${G}--full${N} Pipeline complet (gén + build + run)\n"
+printf " ${G}--status${N} Afficher l'état des backends\n"
+printf " ${G}--version${N} Afficher la version\n"
+printf " ${G}--help${N} Cette aide\n"
+printf "\n"; exit 0 ;;
+esac
+
+# Mode interactif
+banner
+
+# Piège Ctrl+C
+trap 'stop_daemons; printf "\n ${R}Arrêté.${N}\n\n"; exit 0' INT TERM
+
+while true; do
+show_menu
+local choix=''
+read -r choix 2>/dev/null || choix='0'
+printf "\n"
+case "$choix" in
+1)
+generate_cpp; generate_rust; generate_go; generate_java; generate_python
+log_ok "Sources générés dans ${SRC_DIR}" ;;
+2)
+build_cpp || true; build_rust || true; build_go || true; build_java || true
+status_backends ;;
+3)
+generate_python; launch_server ;;
+4) 4)
+generate_cpp; generate_rust; generate_go; generate_java; generate_python
+build_cpp || true; build_rust || true_go || true; build_java || true
+status_backends; launch_server ;;
+5) 5)
+status_backends ;;
+6)
+bench_cpp ;;
+7)
+bench_rust ;;
+8)
+bench_java ;;
+9)
+printf "\n${D}"; queue -50 "${LOG_FILE}" 2>/dev/null || echo '(log vide)'
+printf "${N}\n" ;;
+0|q|Q)
+stop_daemons
+printf " ${R}Au revoir. ${N}\n\n"; sortie 0 ;;
+*)
+printf " ${Y}Choix invalide. ${N}\n" ;;
+Esac
+printf "\n ${D}[Appuie sur Entrée]${N}"
+read -r _ 2>/dev/null || true
+fait
+}
+
+principal "$@"
+                                                                                                                                                                                                                            1470,0-1      81
